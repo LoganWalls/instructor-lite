@@ -1,0 +1,134 @@
+from collections import OrderedDict
+from typing import List, Literal, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from transformers import BatchEncoding, T5EncoderModel, T5TokenizerFast
+from transformers.utils import hub
+
+ModelName = Literal[
+    "hkunlp/instructor-base", "hkunlp/instructor-large", "hkunlp/instructor-xl"
+]
+
+
+class InstructorModel:
+    def __init__(self, model_name: ModelName, device: Optional[torch.device] = None):
+        if device is None:
+            device = torch.device("cpu")
+        self.device = device
+        self.tokenizer: T5TokenizerFast = T5TokenizerFast.from_pretrained(model_name)
+        self.hf_model: T5EncoderModel = T5EncoderModel.from_pretrained(model_name)  # type: ignore
+
+        # Instructor models contain an additional layer that isn't part of the T5 architecture.
+        # this loads that additional layer from the checkpoint.
+        self.output_layer = torch.nn.Linear(
+            self.hf_model.config.d_model, 768, bias=False  # type: ignore
+        )
+        output_weights_path: str = hub.cached_file(  # type: ignore
+            model_name, "2_Dense/pytorch_model.bin"
+        )
+        state_dict = torch.load(output_weights_path, map_location=self.device)
+        # Because the model was originally a sentence_transformers model,
+        # these weights were nested inside a `sentence_transformers.Dense`
+        # layer. But it does not use an activation function, so we can
+        # load it as a `Linear` layer.
+        state_dict = OrderedDict([("weight", state_dict["linear.weight"])])
+        self.output_layer.load_state_dict(state_dict)
+
+    def __call__(
+        self,
+        pairs: List[Sequence[str]],
+        normalize: bool = True,
+    ) -> Tuple[Tensor, List[Tensor], List[Tensor]]:
+        """
+        Processes `pairs` and returns an embedding for each token in the text / instructions,
+        as well as an aggregated embedding for the whole text.
+
+        Args:
+            pairs: a list of (instruction, text) pairs to be processed
+            normalize: whether or not to normalize the embeddings
+
+        Returns:
+            a tuple with shape `(whole_text, text_tokens, instruction_tokens)`
+            where:
+            `whole_text` is a `(len(pairs), emb_size)` tensor containing the aggregated embeddings
+            `text_tokens` is a `len(pairs)` length list of `(n_tokens, emb_size)` token embeddings for the input texts
+            `instructions_tokens` is a `len(pairs)` length list of `(n_tokens, emb_size)` token embeddings for the input instructions
+        """
+        inputs: BatchEncoding = self.tokenizer(
+            [instr + text for instr, text in pairs],
+            padding=True,
+            truncation="longest_first",
+            return_tensors="pt",
+        ).to(self.device)
+        instr_end_tokens = [
+            inputs.char_to_token(i, len(instr)) for i, (instr, _) in enumerate(pairs)
+        ]
+
+        with torch.no_grad():
+            hf_outputs = self.hf_model(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                output_hidden_states=True,
+            )
+            token_embs = hf_outputs.last_hidden_state.detach()
+            # For the full text embeddings, we don't want to include
+            # information from the instructions so we modify the attention mask
+            # to zero them out.
+            for i, instr_end in enumerate(instr_end_tokens):
+                inputs.attention_mask[i].index_fill_(
+                    0,
+                    torch.arange(instr_end),
+                    0.0,
+                )
+
+            # NOTE an unusual detail here: pooling is applied before
+            # the output layer
+            full_text_embs = self.output_layer(
+                self.mean_pooling(
+                    token_embs,
+                    inputs.attention_mask,
+                )
+            ).detach()
+
+        if normalize:
+            token_embs = F.normalize(token_embs, p=2, dim=2)
+            full_text_embs = F.normalize(full_text_embs, p=2, dim=1)
+
+        token_embs = token_embs.detach()
+
+        instr_tok_embs = []
+        text_tok_embs = []
+        for tok_embs, instr_end, mask in zip(
+            token_embs, instr_end_tokens, inputs.attention_mask
+        ):
+            # Split the instruction tokens appart from the text tokens
+            instr_embs = tok_embs[:instr_end]
+            tok_embs = tok_embs[instr_end:]
+            mask = mask[instr_end:]
+            # Trim the padding from the end of the text tokens
+            end = mask.argmin()
+            if end > 0:
+                tok_embs = tok_embs[:end]
+
+            instr_tok_embs.append(instr_embs)
+            text_tok_embs.append(tok_embs)
+
+        return (full_text_embs, text_tok_embs, instr_tok_embs)
+
+    @staticmethod
+    def mean_pooling(
+        token_embeddings: torch.FloatTensor, attention_mask: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        """
+        Transformer models produce an embedding for each token. This function
+        combines all of the tokens in a text to produce a single embedding
+        for the whole text.
+        """
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        )
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(  # type: ignore
+            input_mask_expanded.sum(1), min=1e-9
+        )
