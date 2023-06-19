@@ -21,7 +21,9 @@ To initialize the model, provide a name or path of a model checkpoint. To use on
 
 The model also accepts an optional `device` parameter which can be used to specify which `torch.device` the model should run on (default is `"cpu"`).  
 
-Once the model is initialized, it can be called with a list of instruction / text pairs, and will return both the embedding for the full text as well as per-token embeddings for each of the instructions and texts. It also accepts a `normalize` parameter, which will normalize the resulting embeddings.
+Once the model is initialized, you can call `model.encode()` on your instruction / text pairs to obtain an encoding object. Calling the model on the encoding object will return both the embedding for the full text as well as per-token embeddings for the instructions and texts. It also accepts a `normalize` parameter, which will normalize the resulting embeddings. 
+
+The encoding object also has a `text_char_to_token()` method, which you can use to extract embeddings for specific tokens from the original text, without worrying about the instruction.
 
 ```python
 import torch
@@ -34,14 +36,20 @@ pairs = [
     ("Represent the sentence for retrieval",  "The quick brown fox jumps over the lazy dog."),
 ]
 
-full_text_embs, token_embs, instr_token_embs = model(pairs, normalize=True)
+encoding = model.encode(pairs)
+
+full_text_embs, token_embs = model(encoding, normalize=True)
 
 # an aggregate embedding that represents "It was the best of times, it was the worst of times..." based on the instruction "Represent the quote for clustering"
 full_text_embs[0]
 
-# embeddings for each token in "It was the best of times, it was the worst of times..."
+# embeddings for each token in the concatenation of the first instruction / text pair:
+# "Represent the quote for clusteringIt was the best of times, it was the worst of times..."
 token_embs[0] 
 
-# embeddings for each token in "Represent the quote for clustering"
-instr_token_embs[0] 
+# embeddings for the first token in the first text: "It was the best of times, it was the worst of times..."
+token_embs[0, encoding.text_char_to_token(0, 0)]
+
+# embeddings for the first token in the second text: "The quick brown fox jumps over the lazy dog."
+token_embs[1, encoding.text_char_to_token(1, 0)]
 ```
